@@ -8,59 +8,99 @@ import signal
 import json
 from math import radians, cos, sin, sqrt, atan2
 
+AGPS_TIMESTAMP_FILE = "/tmp/last_agps_injection.time"
+LAST_COORDS_FILE = "/tmp/last_gps_coordinates.json"
+
+def needs_agps_injection(threshold_minutes=30):
+    try:
+        if not os.path.exists(AGPS_TIMESTAMP_FILE):
+            return True
+        age = time.time() - os.path.getmtime(AGPS_TIMESTAMP_FILE)
+        return age > threshold_minutes * 60
+    except Exception:
+        return True
+
+def mark_agps_injected():
+    with open(AGPS_TIMESTAMP_FILE, "w") as f:
+        f.write(str(time.time()))
+
+def save_last_coordinates(lat, lon):
+    with open(LAST_COORDS_FILE, "w") as f:
+        json.dump({"lat": lat, "lon": lon}, f)
+
+def load_last_coordinates():
+    try:
+        with open(LAST_COORDS_FILE) as f:
+            data = json.load(f)
+            return data["lat"], data["lon"]
+    except Exception:
+        return None, None
+
 def get_gps_coordinates(timeout=30):
     print("📡 Initializing GNSS for fast fix...")
 
-    # 1. Power on GNSS
+    # Power on GNSS
     try:
-        subprocess.run(['sudo', 'tee', '/sys/class/gnss/gnss0/power/control'], input=b'on\n', check=True)
+        subprocess.run(['sudo', 'tee', '/sys/class/gnss/gnss0/power/control'], input=b'on\n', check=True, stdout=subprocess.DEVNULL)
         print("✅ GNSS powered on.")
     except Exception as e:
         print(f"⚠️ GNSS power control failed: {e}")
 
-    # 2. Run droid4-agps (if available)
-    agps_path = os.path.expanduser('~/ps/droid4-agps/droid4-agps')
-    if os.path.exists(agps_path):
-        print("📥 Injecting A-GPS data...")
-        try:
-            subprocess.run(['sudo', agps_path], timeout=15)
-            print("✅ A-GPS injection complete.")
-        except Exception as e:
-            print(f"⚠️ A-GPS injection failed: {e}")
-    else:
-        print("⚠️ droid4-agps not found, skipping A-GPS injection.")
-
-    # 3. Start gpsd
+    # Stop gpsd to avoid injection conflict
     subprocess.run(['sudo', 'killall', 'gpsd'], stderr=subprocess.DEVNULL)
-    subprocess.run(['sudo', 'gpsd', '/dev/gnss0', '-F', '/var/run/gpsd.sock'])
-    print("🚀 gpsd started on /dev/gnss0")
 
-    # 4. Monitor gpspipe for a TPV fix
+    # Inject A-GPS if needed
+    agps_path = os.path.expanduser('~/ps/droid4-agps/droid4-agps')
+    if needs_agps_injection():
+        if os.path.exists(agps_path):
+            print("📥 Injecting A-GPS data...")
+            try:
+                subprocess.run(['sudo', agps_path], timeout=20)
+                mark_agps_injected()
+                print("✅ A-GPS injected.")
+            except Exception as e:
+                print(f"⚠️ A-GPS injection failed: {e}")
+        else:
+            print("⚠️ A-GPS binary not found.")
+    else:
+        print("🕒 A-GPS already injected recently — skipping.")
+
+    # Start gpsd on correct device
+    subprocess.run(['sudo', 'gpsd', '/dev/gnss0', '-F', '/var/run/gpsd.sock'])
+    print("🚀 gpsd started.")
+
+    # Read GPS data
     print("🔍 Waiting for GPS fix...")
     try:
-        proc = subprocess.Popen(['gpspipe', '-w'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        start_time = time.time()
-
+        proc = subprocess.Popen(['gpspipe', '-w'], stdout=subprocess.PIPE, text=True)
+        start = time.time()
         for line in proc.stdout:
             if '"class":"TPV"' in line:
                 try:
                     data = json.loads(line)
                     if data.get("mode", 0) >= 2 and "lat" in data and "lon" in data:
                         os.kill(proc.pid, signal.SIGTERM)
-                        lat = data["lat"]
-                        lon = data["lon"]
-                        print(f"✅ GPS fix: ({lat}, {lon})")
+                        lat, lon = data["lat"], data["lon"]
+                        print(f"✅ GPS FIX: ({lat}, {lon})")
+                        save_last_coordinates(lat, lon)
                         return lat, lon
                 except json.JSONDecodeError:
                     continue
-            if time.time() - start_time > timeout:
+            if time.time() - start > timeout:
                 os.kill(proc.pid, signal.SIGTERM)
-                print("❌ Timeout: No GPS fix within time limit.")
+                print("❌ Timeout: No GPS fix.")
                 break
     except Exception as e:
-        print(f"❌ GPS fix monitoring error: {e}")
+        print(f"❌ GPS read error: {e}")
 
-    exit(1)
+    # Use fallback
+    lat, lon = load_last_coordinates()
+    if lat and lon:
+        print(f"📍 Using last known coordinates: ({lat}, {lon})")
+        return lat, lon
+    else:
+        print("❌ No GPS fix and no fallback available.")
+        exit(1)
 def fetch_citybikes_data(city_query):
     try:
         networks = requests.get("https://api.citybik.es/v2/networks").json()["networks"]
